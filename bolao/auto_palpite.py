@@ -244,7 +244,8 @@ def processar_jogo(dt, nome, url, enviar=True):
     suspeito, ok_trip, msg_trip = diagnostico(nome, info, qual)
     corpo = montar(dt, nome, odds, disp, relatorio, info, avisos, msg_trip)
     ph, pa = info["palpite"]
-    assunto = (f"⚽ Palpite: {nome} → {ph}x{pa}"
+    ko = "  [⚠ MATA-MATA 120' — NÃO travar sem conferir]" if fase >= 2 else ""
+    assunto = (f"⚽ Palpite: {nome} → {ph}x{pa}{ko}"
                + ("  [⚠ CONFERIR captura]" if suspeito else ""))
     if enviar:
         enviar_email(assunto, corpo)
@@ -269,7 +270,8 @@ def rechecar(dt, nome, url, antigo):
                   f"MANTENHA o palpite anterior ({antigo}).\n\n" if suspeito else
                   "RECHECAGEM (~T-20): a linha andou e o palpite MUDOU — use ESTE.\n\n")
                  + montar(dt, nome, odds, disp, relatorio, info, avisos, msg_trip))
-        enviar_email(f"⚠ MUDOU: {nome} → {novo} (era {antigo})"
+        ko = "  [MATA-MATA 120']" if fase >= 2 else ""
+        enviar_email(f"⚠ MUDOU: {nome} → {novo} (era {antigo}){ko}"
                      + ("  [⚠ CONFERIR captura]" if suspeito else ""), corpo)
         logar(f"recheck: {nome} MUDOU {antigo} → {novo} | suspeito={suspeito}")
     else:

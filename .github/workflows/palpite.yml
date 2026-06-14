@@ -43,5 +43,6 @@ jobs:
           git add bolao/dados/_palpites_enviados.json bolao/dados/_fixtures_cache.json || true
           if ! git diff --cached --quiet; then
             git commit -m "estado [skip ci]"
-            git push origin HEAD:${{ github.ref_name }}
+            git pull --rebase origin ${{ github.ref_name }} || true
+            git push origin HEAD:${{ github.ref_name }} || true
           fi
