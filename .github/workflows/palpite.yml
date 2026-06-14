@@ -1,0 +1,47 @@
+name: Bolao palpite
+
+# Roda na NUVEM do GitHub (notebook pode estar desligado). A cada 15 min varre o
+# calendario e, p/ jogo a ~10-55 min do kickoff, manda o palpite FINAL no Telegram.
+# Janela larga (10-55) tolera o atraso/jitter do agendador do GitHub.
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      flag:
+        description: "vazio = varredura normal | --teste = msg de teste | --digest = jogos de hoje"
+        required: false
+        default: ""
+
+permissions:
+  contents: write          # p/ commitar o estado (dedup) de volta no repo
+
+concurrency:
+  group: bolao-palpite
+  cancel-in-progress: false
+
+jobs:
+  palpite:
+    runs-on: ubuntu-latest
+    env:
+      TZ: America/Sao_Paulo          # CRITICO: now() em horario de Brasilia (runner e UTC)
+      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - run: pip install -r requirements.txt
+      - run: python -m bolao.auto_palpite ${{ github.event.inputs.flag }}
+      - name: Persistir estado (dedup)
+        run: |
+          git config user.name "bolao-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bolao/dados/_palpites_enviados.json bolao/dados/_fixtures_cache.json || true
+          if ! git diff --cached --quiet; then
+            git commit -m "estado [skip ci]"
+            git push origin HEAD:${{ github.ref_name }}
+          fi

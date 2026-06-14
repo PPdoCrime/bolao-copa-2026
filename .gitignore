@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+bolao/dados/auto_palpite.log
+bolao/_jogo2_tmp.py
+*.tmp
+# dados de backtest (football-data) não são usados na nuvem — só o runtime importa:
+bolao/dados/*.csv
+bolao/dados/WorldCup2026.xlsx
+# NÃO ignorar o estado/cache do robô — eles SÃO commitados pela Action:
+!bolao/dados/_palpites_enviados.json
+!bolao/dados/_fixtures_cache.json
