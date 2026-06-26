@@ -13,8 +13,10 @@ uso manual: python -m bolao.auto_palpite                      (uma varredura)
 O que segue HUMANO (não dá pra automatizar): lesão/expulsão/clima súbito APÓS a captura
 (POLITICA lista 2), confirmação de time reserva na escalação (rodada 3) e o LOCK no app.
 Estado de ranking: editar dados/auto_config.json {"estado": "LIDER|PELOTAO|CACADOR"}.
-Horários: a listagem do SportyTrader vem em fuso europeu; OFFSET_HORAS converte pra
-Brasília (calibrado no jogo Coreia x Tcheca: listado 22:00, kickoff 23:00 BRT)."""
+Horários: lidos do JSON-LD (schema.org SportsEvent) do HTML cru do SportyTrader —
+startDate vem em ISO COM fuso explícito (UTC), convertido p/ Brasília (UTC-3) de forma
+exata. O horário do texto markdown NÃO tem fuso e oscila ±1h conforme qual servidor do
+jina renderiza (foi o que mostrava 15:00 p/ jogo das 16:00); por isso não é mais usado."""
 import datetime
 import json
 import os
@@ -34,7 +36,6 @@ if sys.stdout is not None:
 from bolao.odds import (COMPETICAO, JINA, UA, achar_jogo, analisar, capturar,
                         captura_ok)
 
-OFFSET_HORAS = 1          # listagem + 1h = Brasília (validar no 1º disparo real!)
 JANELA_MIN = (10, 55)     # 1º palpite: kickoff entre 10 e 55 min à frente (10 e não 25
                           # p/ que UMA falha transitória de captura ainda tenha retry)
 JANELA_RECHECK = (4, 26)  # confirmação: recaptura e SÓ avisa se o palpite mudou
@@ -50,8 +51,6 @@ PASTA = os.path.dirname(os.path.abspath(__file__))
 ESTADO = os.path.join(PASTA, "dados", "_palpites_enviados.json")
 FIXCACHE = os.path.join(PASTA, "dados", "_fixtures_cache.json")
 LOGFILE = os.path.join(PASTA, "dados", "auto_palpite.log")
-MESES = {"Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
-         "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12}
 
 
 def logar(msg):
@@ -61,43 +60,60 @@ def logar(msg):
         f.write(linha + "\n")
 
 
+def _do_cache(motivo):
+    """Fallback de calendário: lê o cache em disco. Sem cache, propaga o erro."""
+    if not os.path.exists(FIXCACHE):
+        raise motivo if isinstance(motivo, BaseException) else RuntimeError(str(motivo))
+    logar(f"listagem indisponível ({motivo}) — usando cache do calendário")
+    with open(FIXCACHE, encoding="utf-8") as f:
+        return sorted((datetime.datetime.fromisoformat(d), n, u) for d, n, u in json.load(f))
+
+
 def fixtures():
-    """[(kickoff_brt, 'Time A - Time B', url)] da listagem renderizada. Sucesso grava
-    cache em disco; falha de rede usa o cache (o calendário quase não muda — sem isso,
-    um soluço da rede corporativa na varredura certa = jogo perdido em silêncio)."""
+    """[(kickoff_brt, 'Home - Away', url)] do JSON-LD (schema.org SportsEvent) do HTML
+    cru do SportyTrader. startDate vem em ISO COM fuso explícito → conversão p/ Brasília
+    (UTC-3) exata e imune ao drift de fuso do render (o horário do markdown não tem fuso
+    e oscilava ±1h conforme o servidor do jina). Sucesso grava cache; falha de rede (ou
+    JSON-LD ausente) cai no cache — sem isso, um soluço da rede na varredura certa =
+    jogo perdido em silêncio."""
     try:
-        txt = requests.get(JINA + COMPETICAO, timeout=90, verify=False, headers=UA).text
+        txt = requests.get(JINA + COMPETICAO, timeout=90, verify=False,
+                           headers={**UA, "X-Return-Format": "html"}).text
     except Exception as e:
-        if not os.path.exists(FIXCACHE):
-            raise
-        logar(f"listagem falhou ({type(e).__name__}) — usando cache do calendário")
-        with open(FIXCACHE, encoding="utf-8") as f:
-            return sorted((datetime.datetime.fromisoformat(d), n, u)
-                          for d, n, u in json.load(f))
-    padrao = re.compile(
-        r"(\d{1,2}) (\w{3}) - (\d{2}):(\d{2})\[([^\]]+)\]"
-        r"\((https://www\.sportytrader\.com/en/odds/[a-z0-9-]+-\d+/)\)")
-    hoje = datetime.date.today()
+        return _do_cache(e)
+    brt = datetime.timezone(datetime.timedelta(hours=-3))
     jogos = []
-    for dia, mes, hh, mm, nome, url in padrao.findall(txt):
-        mes_n = MESES.get(mes)
-        if not mes_n:
+
+    def _coletar(o):
+        if isinstance(o, dict):
+            if o.get("@type") == "SportsEvent":
+                start, url = o.get("startDate"), o.get("url")
+                home = (o.get("homeTeam") or {}).get("name")
+                away = (o.get("awayTeam") or {}).get("name")
+                if start and url and home and away:
+                    dt = datetime.datetime.fromisoformat(start)
+                    if dt.tzinfo is None:                 # sem fuso no ISO: assume UTC
+                        dt = dt.replace(tzinfo=datetime.timezone.utc)
+                    dt = dt.astimezone(brt).replace(tzinfo=None)  # naive em horário BRT
+                    jogos.append((dt, f"{home} - {away}", url))
+            for v in o.values():
+                _coletar(v)
+        elif isinstance(o, list):
+            for v in o:
+                _coletar(v)
+
+    for bloco in re.findall(r"<script[^>]*application/ld\+json[^>]*>(.*?)</script>", txt, re.S):
+        try:
+            _coletar(json.loads(bloco.strip()))
+        except ValueError:
             continue
-        ano = hoje.year + (1 if mes_n < hoje.month - 6 else 0)  # virada de ano improvável
-        dt = (datetime.datetime(ano, mes_n, int(dia), int(hh), int(mm))
-              + datetime.timedelta(hours=OFFSET_HORAS))
-        jogos.append((dt, nome, url))
     jogos = sorted(set(jogos))
     if jogos:
         os.makedirs(os.path.dirname(FIXCACHE), exist_ok=True)
         with open(FIXCACHE, "w", encoding="utf-8") as f:
             json.dump([(dt.isoformat(), n, u) for dt, n, u in jogos], f)
-    elif os.path.exists(FIXCACHE):  # render veio vazio/quebrado: cache também
-        logar("listagem veio vazia — usando cache do calendário")
-        with open(FIXCACHE, encoding="utf-8") as f:
-            return sorted((datetime.datetime.fromisoformat(d), n, u)
-                          for d, n, u in json.load(f))
-    return jogos
+        return jogos
+    return _do_cache("JSON-LD vazio (schema mudou?)")  # fetch ok mas sem eventos
 
 
 def contexto(dt):
