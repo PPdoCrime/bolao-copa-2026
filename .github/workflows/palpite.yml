@@ -1,15 +1,24 @@
 name: Bolao palpite
 
-# Roda na NUVEM do GitHub (notebook pode estar desligado). A cada 15 min varre o
-# calendario e, p/ jogo a ~10-55 min do kickoff, manda o palpite FINAL no Telegram.
-# Janela larga (10-55) tolera o atraso/jitter do agendador do GitHub.
+# Roda na NUVEM do GitHub (notebook pode estar desligado). O `schedule` do GitHub e
+# best-effort e ESTRANGULA este repo (com */15 = 96 tentativas/dia ele so rodou ~3x).
+# Por isso NAO dependemos do schedule: a CORRENTE se auto-perpetua. Cada run, ao
+# iniciar, dispara o PROXIMO via repository_dispatch (precisa de um PAT — o
+# GITHUB_TOKEN automatico nao tem permissao de disparar outro workflow). Com
+# cancel-in-progress:false o sucessor fica PENDENTE atras do run atual e EMENDA quando
+# ele acaba => cobertura 24/7, buraco ~0, independente do schedule. Cada run ainda faz
+# um loop de ~5h varrendo a cada 15 min (cobre caso a corrente atrase). Repo PUBLICO =
+# minutos ILIMITADOS (gratis). SEM o secret DISPATCH_PAT a corrente nao arma e ele cai
+# no schedule (degradado ~15h/dia) — nao quebra. Garantia p/ um jogo: Run workflow.
 on:
-  schedule:
-    - cron: "*/15 * * * *"
+  repository_dispatch:        # a CORRENTE (auto-disparo via PAT) e o gatilho principal
+    types: [tick]
+  schedule:                   # so REVIVE a corrente se ela morrer (raro); nao e o motor
+    - cron: "0 */3 * * *"
   workflow_dispatch:
     inputs:
       flag:
-        description: "vazio = varredura normal | --teste = msg de teste | --digest = jogos de hoje"
+        description: "vazio = loop normal | --teste = msg de teste | --digest = jogos de hoje"
         required: false
         default: ""
 
@@ -18,15 +27,18 @@ permissions:
 
 concurrency:
   group: bolao-palpite
-  cancel-in-progress: false
+  cancel-in-progress: false  # sucessor fica PENDENTE e emenda no fim do run (corrente)
 
 jobs:
   palpite:
     runs-on: ubuntu-latest
+    timeout-minutes: 330       # < limite de 360 do GitHub (o loop de ~5h para antes)
     env:
       TZ: America/Sao_Paulo          # CRITICO: now() em horario de Brasilia (runner e UTC)
       TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      DISPATCH_PAT: ${{ secrets.DISPATCH_PAT }}   # PAT fine-grained, Contents:RW, so este repo
+      FLAG: ${{ github.event.inputs.flag }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -35,14 +47,40 @@ jobs:
           cache: pip
           cache-dependency-path: requirements.txt
       - run: pip install -r requirements.txt
-      - run: python -m bolao.auto_palpite ${{ github.event.inputs.flag }}
-      - name: Persistir estado (dedup)
+      - name: Varredura (one-shot no teste/digest; senao auto-corrente + loop ~5h)
         run: |
           git config user.name "bolao-bot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add bolao/dados/_palpites_enviados.json bolao/dados/_fixtures_cache.json || true
-          if ! git diff --cached --quiet; then
-            git commit -m "estado [skip ci]"
-            git pull --rebase origin ${{ github.ref_name }} || true
-            git push origin HEAD:${{ github.ref_name }} || true
+          persistir() {
+            git add bolao/dados/_palpites_enviados.json || true   # so dedup (sem churn de cache)
+            if ! git diff --cached --quiet; then
+              git commit -m "estado [skip ci]" || true
+              git pull --rebase origin "$GITHUB_REF_NAME" || true
+              git push origin "HEAD:$GITHUB_REF_NAME" || true
+            fi
+          }
+          if [ -n "$FLAG" ]; then            # --teste / --digest = uma passada so (nao arma corrente)
+            python -m bolao.auto_palpite $FLAG
+            persistir
+            exit 0
           fi
+          # RE-ARMA A CORRENTE ja no inicio: o sucessor fica pendente e emenda no fim
+          # deste run. Disparado no inicio (nao no fim) p/ sobreviver a um crash no meio.
+          # Trava: para de se auto-perpetuar depois da Copa (final 19/07/2026).
+          if [ -n "$DISPATCH_PAT" ] && [ "$(date +%Y%m%d)" -le "20260720" ]; then
+            curl -sS -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $DISPATCH_PAT" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/dispatches" \
+              -d '{"event_type":"tick"}' \
+              && echo "corrente re-armada (proximo run pendente)" \
+              || echo "falha ao re-armar — segue no schedule de backup"
+          else
+            echo "DISPATCH_PAT ausente ou apos a Copa: sem auto-corrente (so schedule)"
+          fi
+          for i in $(seq 1 20); do           # 20 x 15 min = ~5h por run (cobre atraso da corrente)
+            python -m bolao.auto_palpite || true
+            persistir
+            if [ "$i" -lt 20 ]; then sleep 900; fi
+          done

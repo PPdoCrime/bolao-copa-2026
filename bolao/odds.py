@@ -59,8 +59,15 @@ def achar_jogo(t1, t2):
     """Acha a URL do jogo na página da competição casando os dois times no slug."""
     f1 = SLUGS.get(_ascii(t1), _ascii(t1).replace(" ", "-"))
     f2 = SLUGS.get(_ascii(t2), _ascii(t2).replace(" ", "-"))
-    html = _get(COMPETICAO, timeout=30)
-    links = sorted(set(re.findall(r'href="(/en/odds/[a-z0-9-]+-\d{6,}/)"', html)))
+    try:
+        html = _get(COMPETICAO, timeout=30)
+        links = sorted(set(re.findall(r'href="(/en/odds/[a-z0-9-]+-\d{6,}/)"', html)))
+    except Exception:
+        # SportyTrader às vezes 403 no fetch direto (Cloudflare/proxy corporativo);
+        # via jina (server-side) contorna. No markdown os links vêm como URL completa.
+        html = _get(JINA + COMPETICAO, timeout=60)
+        links = sorted(set(re.findall(
+            r"https://www\.sportytrader\.com(/en/odds/[a-z0-9-]+-\d{6,}/)", html)))
     cand = [u for u in links if f1 in u and f2 in u]
     if not cand:
         cand = [u for u in links if f1 in u or f2 in u]
@@ -71,35 +78,74 @@ def achar_jogo(t1, t2):
     return "https://www.sportytrader.com" + cand[0]
 
 
-# o 3º/2º número é seguido OU de espaço (layout do Brasil) OU de ']' que fecha o link
-# (layout da Austrália) — lookahead aceita os dois sem consumir (bug pego em 13/06)
-_ROW_3 = re.compile(r"100x45/[^)]+?\.webp\)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)(?=\s|\])")
-_ROW_2 = re.compile(r"100x45/[^)]+?\.webp\)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)(?=\s|\])")
+# A render do jina oscila entre DOIS layouts (medido 26/06, mesmo instante, jogos
+# diferentes): (A) "flat" — texto achatado sem logos, cada cota numa linha, com a
+# célula de bônus (€/$/£ ou "See the offer") aparecendo de forma INCONSTANTE (vários
+# jogos sem nenhuma); (B) "rich" — markdown com logo das casas, cada casa numa linha
+# "100x45/<casa>.webp) o1 o2 [o3]](...". O parser aguenta os dois e NÃO depende da
+# célula de bônus como terminador (o que matava o flat sem bônus). Cada mercado é uma
+# seção que vai do seu título ao título do PRÓXIMO mercado conhecido — vale nos dois.
+MERCADOS = (
+    "Full Time Result", "Half Time Result", "Half Time/Full Time",
+    "Under/Over 0.5 Goals", "Under/Over 1.5 Goals", "Under/Over 2.5 Goals",
+    "Under/Over 3.5 Goals", "Under/Over 4.5 Goals", "Under/Over 5.5 Goals",
+    "Both Teams To Score", "Double Chance", "Draw No Bet", "Odd/Even",
+    "Correct Score", "Highest Scoring Half", "Total Corners", "Handicap",
+)
+_RICH = re.compile(r"100x45/[^)]+?\.webp\)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)"
+                   r"(?:\s+(\d+(?:\.\d+)?))?")  # 2 ou 3 cotas inline (OU / 1X2)
+_NUM = re.compile(r"\d+(?:\.\d+)?")
 
 
-def capturar(url_jogo):
-    """Renderiza a página do jogo e devolve as 5 odds medianas + nº de casas."""
-    txt = _get(JINA + url_jogo, timeout=90)
-    i_1x2 = txt.find("Full Time Result")
-    i_ou = txt.find("Under/Over 2.5 Goals")
-    if i_1x2 < 0 or i_ou < 0:
+def _secao(txt, titulo):
+    """Recorta a seção de UM mercado: do seu título até o título do próximo mercado
+    conhecido (o que vier antes). Independe do layout (flat ou rich)."""
+    i = txt.find(titulo)
+    if i < 0:
+        return ""
+    fim = len(txt)
+    for m in MERCADOS:
+        j = txt.find(m, i + len(titulo))
+        if 0 < j < fim:
+            fim = j
+    return txt[i:fim]
+
+
+def _linhas(bloco, k):
+    """Cotas de uma seção como lista de tuplas de k cotas. Aguenta os dois layouts."""
+    if "100x45/" in bloco:                       # layout B (rich): casa com logo
+        linhas = []
+        for m in _RICH.findall(bloco):
+            vals = [v for v in m if v]
+            if len(vals) >= k:
+                linhas.append(tuple(vals[:k]))
+        if len(linhas) >= 3:
+            return linhas
+    # layout A (flat): números puros após "BONUS UP TO", ignorando células de bônus
+    # (inconstantes) e parando no texto do próximo mercado.
+    j = bloco.find("BONUS UP TO")
+    resto = bloco[j + len("BONUS UP TO"):] if j >= 0 else bloco
+    nums = []
+    for ln in resto.split("\n"):
+        s = ln.strip()
+        if not s:
+            continue
+        if _NUM.fullmatch(s):
+            nums.append(s)
+        elif s[0] in "€$£" or s.lower().startswith("see the offer"):
+            continue                             # célula de bônus → ignora
+        else:
+            break                                # texto = próximo mercado → fim
+    return [tuple(nums[x:x + k]) for x in range(0, (len(nums) // k) * k, k)]
+
+
+def parse_render(txt):
+    """Extrai as 5 odds medianas + qual de um render jina. Pura (testável sem rede)."""
+    if "Full Time Result" not in txt or "Under/Over 2.5 Goals" not in txt:
         raise SystemExit("seções de odds não encontradas no render — tentar de novo "
                          "(jina instável) ou capturar manual (FONTES.md)")
-
-    def bloco_da_secao(inicio):
-        """Cada mercado tem UM cabeçalho ' Bookmaker '; a tabela vai até o cabeçalho
-        do mercado seguinte (evita vazar linhas de outros mercados pras medianas)."""
-        marcadores = [m.start() for m in re.finditer(r"\sBookmaker\s", txt)]
-        meu = next((m for m in marcadores if m > inicio), None)
-        if meu is None:
-            raise SystemExit("tabela sem cabeçalho Bookmaker — layout mudou (FONTES.md)")
-        prox = next((m for m in marcadores if m > meu), len(txt))
-        return txt[meu:prox]
-
-    bloco_1x2 = bloco_da_secao(i_1x2)
-    bloco_ou = bloco_da_secao(i_ou)
-    m1x2 = _ROW_3.findall(bloco_1x2)
-    mou = _ROW_2.findall(bloco_ou)
+    m1x2 = _linhas(_secao(txt, "Full Time Result"), 3)
+    mou = _linhas(_secao(txt, "Under/Over 2.5 Goals"), 2)
     if len(m1x2) < 3 or len(mou) < 3:
         raise SystemExit(f"poucas casas parseadas (1X2={len(m1x2)}, OU={len(mou)}) — "
                          "layout mudou? conferir manual (FONTES.md)")
@@ -127,6 +173,11 @@ def capturar(url_jogo):
             "overround_1x2": 1 / casa + 1 / emp + 1 / fora,
             "overround_ou": 1 / under + 1 / over}
     return {"over": over, "under": under, "casa": casa, "empate": emp, "fora": fora}, disp, qual
+
+
+def capturar(url_jogo):
+    """Renderiza a página do jogo e devolve as 5 odds medianas + nº de casas."""
+    return parse_render(_get(JINA + url_jogo, timeout=90))
 
 
 def captura_ok(qual):
